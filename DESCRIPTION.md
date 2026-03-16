@@ -114,8 +114,15 @@ This prevents context overflow while ensuring important information isn't missed
 ### 2. Relevance Scoring
 Files are scored based on:
 - **Recency (30%)**: How recently was this file updated?
+  - Layer-aware decay: L1 decisions expire in 14 days, L4 research in 180 days
+  - Minimum floor of 0.1 — no file ever fully ages out
 - **Topic Match (50%)**: How well does it match the current topic?
+  - Basic stemming handles term variations (electrode ≈ electrodes)
+  - Searches id, tags, filename, and summary/body (not generic type field)
 - **User Priority (20%)**: Has the user explicitly referenced this?
+  - Includes status, confidence, project match, and priority tags
+- **Layer Bonus**: Applied to all files regardless of project match
+  - L1=1.1, L2=1.05, L3=1.0, L4=0.95, cross=1.0
 
 ### 3. Token Budget Management
 The system tracks token usage with four degradation levels:
