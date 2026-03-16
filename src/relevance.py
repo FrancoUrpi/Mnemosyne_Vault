@@ -4,10 +4,16 @@ Relevance Scoring Engine for Mnemosyne Knowledge Vault.
 
 Scores vault files based on:
   - Recency (30%): How recently the file was updated
+      - Layer-aware halflife: L1=14d, L2=30d, L3=90d, L4=180d
+      - Floor of 0.1 — research files never fully age out
   - Topic match (50%): How well the file matches the current topic
-  - User priority (20%): Explicit priority signals (tags, status)
+      - Basic stemming: electrode≈electrodes, test≈testing
+      - Searches id, tags, filename, summary/body (not type field)
+  - User priority (20%): Explicit priority signals (tags, status, project)
+  - Layer bonus: Applied to all files regardless of project match
+      - L1=1.1, L2=1.05, L3=1.0, L4=0.95, cross=1.0
 
-Formula: score = recency×0.3 + topic_match×0.5 + user_priority×0.2
+Formula: score = min(1.0, (recency×0.3 + topic×0.5 + priority×0.2) × layer_bonus)
 
 Usage:
     from relevance import RelevanceScorer
@@ -35,8 +41,17 @@ WEIGHT_RECENCY = 0.3
 WEIGHT_TOPIC = 0.5
 WEIGHT_PRIORITY = 0.2
 
-# Recency decay: files older than this score 0
-RECENCY_HALFLIFE_DAYS = 30
+# Recency decay: layer-aware halflife (days)
+RECENCY_HALFLIFE_BY_LAYER = {
+    "L1": 14,     # Decisions change fast
+    "L2": 30,     # Components evolve
+    "L3": 90,     # Rules are stable
+    "L4": 180,    # Research persists
+    "cross": 60,
+}
+
+# Minimum recency floor — never fully zero out a file
+RECENCY_FLOOR = 0.1
 
 # Status priority multipliers
 STATUS_PRIORITY = {
@@ -52,13 +67,13 @@ CONFIDENCE_PRIORITY = {
     "low": 0.4,
 }
 
-# Layer relevance bonus (L1/L2 slightly boosted for project context)
-LAYER_PROJECT_BONUS = {
-    "L1": 1.2,
-    "L2": 1.1,
+# Layer relevance bonus — applied to all files (not gated on project match)
+LAYER_BONUS = {
+    "L1": 1.1,
+    "L2": 1.05,
     "L3": 1.0,
-    "L4": 0.9,
-    "cross": 0.8,
+    "L4": 0.95,
+    "cross": 1.0,
 }
 
 
@@ -126,12 +141,28 @@ STOP_WORDS = {
 
 
 def extract_topic_terms(topic: str) -> Set[str]:
-    """Extract meaningful terms from a topic string."""
+    """Extract meaningful terms from a topic string with basic stemming."""
     # Lowercase and split on non-alphanumeric
     words = re.findall(r'[a-z0-9]+', topic.lower())
-    # Remove stop words and short words
-    terms = {w for w in words if w not in STOP_WORDS and len(w) > 2}
-    return terms
+    # Remove stop words and very short words (keep 2+ for AI, IoT, EEG)
+    terms = {w for w in words if w not in STOP_WORDS and len(w) >= 2}
+
+    # Add stemmed variants so "electrode" matches "electrodes"
+    stemmed = set()
+    for w in terms:
+        stemmed.add(w)
+        if w.endswith("es") and len(w) > 3:
+            stemmed.add(w[:-2])   # electrodes -> electrode
+        elif w.endswith("s") and len(w) > 2:
+            stemmed.add(w[:-1])   # sensors -> sensor
+        if w.endswith("ing") and len(w) > 4:
+            stemmed.add(w[:-3])   # testing -> test
+        if w.endswith("ed") and len(w) > 3:
+            stemmed.add(w[:-2])   # oxidized -> oxidiz (partial, better than nothing)
+        if w.endswith("tion") and len(w) > 4:
+            stemmed.add(w[:-4] + "t")  # oxidation -> oxidat (partial)
+
+    return stemmed
 
 
 # ─── Relevance Scorer ─────────────────────────────────────────────
@@ -193,9 +224,9 @@ class RelevanceScorer:
         breakdown.reasons = priority_result["reasons"]
 
         # ─── Layer Bonus ──────────────────────────────────────────
+        # Always applied (not gated on project match)
         layer = metadata.get("layer", "cross")
-        if project and metadata.get("project") == project:
-            breakdown.layer_bonus = LAYER_PROJECT_BONUS.get(layer, 1.0)
+        breakdown.layer_bonus = LAYER_BONUS.get(layer, 1.0)
 
         # ─── Total Score ──────────────────────────────────────────
         base_score = (
@@ -231,7 +262,11 @@ class RelevanceScorer:
     # ─── Scoring Components ───────────────────────────────────────
 
     def _score_recency(self, metadata: Dict) -> float:
-        """Score based on how recently the file was updated."""
+        """Score based on how recently the file was updated.
+        
+        Uses layer-aware halflife: research files persist longer than decisions.
+        Never returns zero — applies RECENCY_FLOOR minimum.
+        """
         updated_str = metadata.get("updated", metadata.get("created", ""))
         if not updated_str:
             return 0.5  # Default for unknown date
@@ -241,9 +276,13 @@ class RelevanceScorer:
             now = datetime.now()
             days_old = (now - updated).days
 
-            # Exponential decay with halflife
-            score = math.exp(-0.693 * days_old / RECENCY_HALFLIFE_DAYS)
-            return max(0.0, min(1.0, score))
+            # Layer-aware halflife
+            layer = metadata.get("layer", "cross")
+            halflife = RECENCY_HALFLIFE_BY_LAYER.get(layer, 60)
+
+            # Exponential decay with halflife, floor never goes to zero
+            score = math.exp(-0.693 * days_old / halflife)
+            return max(RECENCY_FLOOR, min(1.0, score))
 
         except (ValueError, TypeError):
             return 0.5
@@ -263,9 +302,9 @@ class RelevanceScorer:
             return {"score": 0.5, "matched": []}
 
         # Build searchable text from metadata
+        # NOTE: "type" excluded — too generic (pollutes with "research", "component", etc.)
         searchable = " ".join([
             str(metadata.get("id", "")),
-            str(metadata.get("type", "")),
             " ".join(metadata.get("tags", [])),
             metadata.get("_filename", ""),
         ]).lower()
